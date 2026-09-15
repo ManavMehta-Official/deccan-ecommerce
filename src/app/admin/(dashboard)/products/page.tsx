@@ -1,7 +1,7 @@
 import { getPaginatedProducts, getCategories } from '@/db/queries';
 import { ProductTable } from '@/components/admin/productTable';
 import Link from 'next/link';
-import { ShoppingBag, Plus } from 'lucide-react';
+import { Plus } from 'lucide-react';
 import { db } from '@/db';
 import { productImages } from '@/db/schema';
 import { inArray } from 'drizzle-orm';

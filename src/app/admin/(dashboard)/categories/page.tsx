@@ -1,7 +1,6 @@
 import { getCategories } from '@/db/queries';
 import { CategoryTable } from '@/components/admin/categoryTable';
 import { CategoryDialog } from '@/components/admin/categoryDialog';
-import { Tag } from 'lucide-react';
 
 export const metadata = { title: 'Categories — Admin' };
 

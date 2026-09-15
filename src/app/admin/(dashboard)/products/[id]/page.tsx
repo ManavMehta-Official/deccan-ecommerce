@@ -2,7 +2,7 @@ import { notFound } from 'next/navigation';
 import { getProductById, getCategories } from '@/db/queries';
 import { ProductForm } from '@/components/admin/productForm';
 import Link from 'next/link';
-import { ArrowLeft, ShoppingBag } from 'lucide-react';
+import { ArrowLeft } from 'lucide-react';
 
 interface Props {
   params: Promise<{ id: string }>;

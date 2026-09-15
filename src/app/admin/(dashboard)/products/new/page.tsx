@@ -1,7 +1,7 @@
 import { getCategories } from '@/db/queries';
 import { ProductForm } from '@/components/admin/productForm';
 import Link from 'next/link';
-import { ArrowLeft, ShoppingBag } from 'lucide-react';
+import { ArrowLeft } from 'lucide-react';
 
 export const metadata = { title: 'New Product — Admin' };
 

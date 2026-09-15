@@ -1,5 +1,5 @@
 import Link from 'next/link';
-import { ImageIcon, RefreshCcw } from 'lucide-react';
+import { RefreshCcw } from 'lucide-react';
 import { db } from '@/db';
 import { productImages, products } from '@/db/schema';
 import { inArray, eq, ilike } from 'drizzle-orm';

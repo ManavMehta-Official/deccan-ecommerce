@@ -31,6 +31,16 @@ export const AUDIT_ACTIONS = [
   'email_settings_updated',
   'settings_updated',
   'email_test_sent',
+  'category_created',
+  'category_updated',
+  'category_deleted',
+  'product_created',
+  'product_updated',
+  'product_deleted',
+  'product_image_uploaded',
+  'product_image_deleted',
+  'product_images_reordered',
+  'media_object_deleted',
 ] as const;
 
 

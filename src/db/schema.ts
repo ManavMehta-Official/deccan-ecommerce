@@ -41,7 +41,6 @@ export const auditEvents = pgTable('audit_events', {
   index('audit_events_actor_user_id_idx').on(table.actorUserId),
   index('audit_events_action_idx').on(table.action),
 ]);
-
 export const accountTokens = pgTable('account_tokens', {
   id: text('id').primaryKey(),
   userId: text('user_id').references(() => users.id, { onDelete: 'cascade' }),
@@ -66,3 +65,61 @@ export const emailSettings = pgTable('email_settings', {
   enabled: integer('enabled').notNull().default(0),
   updatedAt: timestamp('updated_at', { mode: 'date' }).defaultNow().notNull(),
 });
+
+// ─── Ecommerce ────────────────────────────────────────────────────────────────
+
+export const categories = pgTable('categories', {
+  id: text('id').primaryKey(),
+  name: text('name').notNull().unique(),
+  slug: text('slug').notNull().unique(),
+  description: text('description'),
+  createdAt: timestamp('created_at', { mode: 'date' }).defaultNow().notNull(),
+  updatedAt: timestamp('updated_at', { mode: 'date' }).defaultNow().notNull(),
+}, (table) => [
+  index('categories_slug_idx').on(table.slug),
+]);
+
+export const products = pgTable('products', {
+  id: text('id').primaryKey(),
+  categoryId: text('category_id').references(() => categories.id, { onDelete: 'set null' }),
+  name: text('name').notNull(),
+  slug: text('slug').notNull().unique(),
+  description: text('description'),
+  /** Price stored in smallest currency unit (paise). Divide by 100 for display. */
+  price: integer('price').notNull().default(0),
+  outOfStock: integer('out_of_stock').notNull().default(0),
+  newArrival: integer('new_arrival').notNull().default(0),
+  featured: integer('featured').notNull().default(0),
+  /** Dimensions in centimetres */
+  widthCm: integer('width_cm'),
+  heightCm: integer('height_cm'),
+  depthCm: integer('depth_cm'),
+  /** Weight in grams */
+  weightGrams: integer('weight_grams'),
+  createdAt: timestamp('created_at', { mode: 'date' }).defaultNow().notNull(),
+  updatedAt: timestamp('updated_at', { mode: 'date' }).defaultNow().notNull(),
+}, (table) => [
+  index('products_slug_idx').on(table.slug),
+  index('products_category_id_idx').on(table.categoryId),
+  index('products_featured_idx').on(table.featured),
+  index('products_new_arrival_idx').on(table.newArrival),
+]);
+
+export const productImages = pgTable('product_images', {
+  id: text('id').primaryKey(),
+  productId: text('product_id').notNull().references(() => products.id, { onDelete: 'cascade' }),
+  /** Object key in the R2 bucket (used to delete from storage) */
+  r2Key: text('r2_key').notNull(),
+  /** Public CDN URL for rendering */
+  url: text('url').notNull(),
+  /** Smaller WebP derivative used by admin listing and editing interfaces. */
+  thumbnailR2Key: text('thumbnail_r2_key'),
+  thumbnailUrl: text('thumbnail_url'),
+  altText: text('alt_text'),
+  /** Lower number = shown first */
+  position: integer('position').notNull().default(0),
+  createdAt: timestamp('created_at', { mode: 'date' }).defaultNow().notNull(),
+}, (table) => [
+  index('product_images_product_id_idx').on(table.productId),
+  index('product_images_position_idx').on(table.productId, table.position),
+]);

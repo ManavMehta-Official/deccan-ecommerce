@@ -13,14 +13,11 @@ import { Button } from '@/components/ui/button';
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar';
 import { Separator } from '@/components/ui/separator';
 import { 
-  Calendar, 
   CheckCircle2, 
-  Mail, 
   Shield, 
   User as UserIcon, 
   XCircle,
   Copy,
-  Clock,
   Activity
 } from 'lucide-react';
 import { toast } from 'sonner';

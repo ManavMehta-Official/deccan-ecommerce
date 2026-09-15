@@ -12,6 +12,7 @@ import { writeAuditEvent } from '@/lib/audit';
 import { createAccountToken, TOKEN_TYPES } from '@/lib/accountTokens';
 import { sendEmail } from '@/lib/email';
 import { isRateLimited, recordRateLimitFailure, setupRateLimitConfig } from '@/lib/rateLimit';
+import sharp from 'sharp';
 
 export { logoutAdmin };
 
@@ -611,5 +612,472 @@ export async function revokeOtherAdminSessions(): Promise<{ success: boolean; er
   } catch (error) {
     console.error('Revoke sessions error:', error);
     return { success: false, error: 'Failed to revoke other sessions.' };
+  }
+}
+
+// ─── Ecommerce — Categories ────────────────────────────────────────────────────
+
+import { categories, productImages, products } from '@/db/schema';
+import { toSlug } from '@/db/queries';
+import { uploadToR2, deleteFromR2 } from '@/lib/r2';
+
+export async function createCategory(formData: FormData) {
+  const currentUser = await requireAdmin();
+  const nameRaw = formData.get('name');
+  const descriptionRaw = formData.get('description');
+  const name = typeof nameRaw === 'string' ? nameRaw.trim() : '';
+  const description = typeof descriptionRaw === 'string' ? descriptionRaw.trim() : '';
+
+  if (name.length < 2 || name.length > 100) {
+    return { success: false, error: 'Category name must be between 2 and 100 characters.' };
+  }
+
+  const slug = toSlug(name);
+  if (!slug) return { success: false, error: 'Category name must include letters or numbers.' };
+  const id = randomBytes(8).toString('hex');
+
+  try {
+    await db.insert(categories).values({ id, name, slug, description: description || null });
+    await writeAuditEvent({
+      action: 'category_created',
+      outcome: 'success',
+      actorUserId: currentUser.id,
+      targetType: 'category',
+      targetId: id,
+      metadata: { name },
+    });
+    revalidatePath('/admin/categories');
+    return { success: true, id };
+  } catch (error: unknown) {
+    const msg = error instanceof Error ? error.message : String(error);
+    if (msg.includes('unique')) return { success: false, error: 'A category with that name already exists.' };
+    console.error('createCategory error:', error);
+    return { success: false, error: 'Failed to create category.' };
+  }
+}
+
+export async function updateCategory(id: string, formData: FormData) {
+  const currentUser = await requireAdmin();
+  const nameRaw = formData.get('name');
+  const descriptionRaw = formData.get('description');
+  const name = typeof nameRaw === 'string' ? nameRaw.trim() : '';
+  const description = typeof descriptionRaw === 'string' ? descriptionRaw.trim() : '';
+
+  if (name.length < 2 || name.length > 100) {
+    return { success: false, error: 'Category name must be between 2 and 100 characters.' };
+  }
+
+  const slug = toSlug(name);
+  if (!slug) return { success: false, error: 'Category name must include letters or numbers.' };
+
+  try {
+    const [updated] = await db
+      .update(categories)
+      .set({ name, slug, description: description || null, updatedAt: new Date() })
+      .where(eq(categories.id, id))
+      .returning({ id: categories.id });
+
+    if (!updated) return { success: false, error: 'Category not found.' };
+
+    await writeAuditEvent({
+      action: 'category_updated',
+      outcome: 'success',
+      actorUserId: currentUser.id,
+      targetType: 'category',
+      targetId: id,
+      metadata: { name },
+    });
+    revalidatePath('/admin/categories');
+    revalidatePath(`/admin/categories/${id}`);
+    return { success: true };
+  } catch (error: unknown) {
+    const msg = error instanceof Error ? error.message : String(error);
+    if (msg.includes('unique')) return { success: false, error: 'A category with that name already exists.' };
+    console.error('updateCategory error:', error);
+    return { success: false, error: 'Failed to update category.' };
+  }
+}
+
+export async function deleteCategory(id: string) {
+  const currentUser = await requireAdmin();
+
+  // Guard: don't delete a category that still has products assigned
+  const [{ productCount }] = await db
+    .select({ productCount: sql<number>`count(*)` })
+    .from(products)
+    .where(eq(products.categoryId, id));
+
+  if (Number(productCount) > 0) {
+    return { success: false, error: `Cannot delete: ${productCount} product(s) are still in this category. Reassign them first.` };
+  }
+
+  try {
+    const [deleted] = await db
+      .delete(categories)
+      .where(eq(categories.id, id))
+      .returning({ id: categories.id });
+
+    if (!deleted) return { success: false, error: 'Category not found.' };
+
+    await writeAuditEvent({
+      action: 'category_deleted',
+      outcome: 'success',
+      actorUserId: currentUser.id,
+      targetType: 'category',
+      targetId: id,
+    });
+    revalidatePath('/admin/categories');
+    return { success: true };
+  } catch (error) {
+    console.error('deleteCategory error:', error);
+    return { success: false, error: 'Failed to delete category.' };
+  }
+}
+
+// ─── Ecommerce — Products ──────────────────────────────────────────────────────
+
+function parseProductFormData(formData: FormData) {
+  const get = (key: string) => {
+    const v = formData.get(key);
+    return typeof v === 'string' ? v.trim() : '';
+  };
+  const getInt = (key: string) => {
+    const raw = get(key);
+    if (!raw) return null;
+    const value = Number(raw);
+    return Number.isSafeInteger(value) ? value : null;
+  };
+  const getBool = (key: string) => get(key) === 'true' || get(key) === '1' ? 1 : 0;
+
+  return {
+    name: get('name'),
+    description: get('description') || null,
+    /** Price in paise — frontend sends value already multiplied by 100 */
+    price: getInt('price') ?? 0,
+    categoryId: get('categoryId') || null,
+    outOfStock: getBool('outOfStock'),
+    newArrival: getBool('newArrival'),
+    featured: getBool('featured'),
+    widthCm: getInt('widthCm'),
+    heightCm: getInt('heightCm'),
+    depthCm: getInt('depthCm'),
+    weightGrams: getInt('weightGrams'),
+  };
+}
+
+function validateProductData(data: ReturnType<typeof parseProductFormData>) {
+  if (data.name.length < 2 || data.name.length > 200) {
+    return 'Product name must be between 2 and 200 characters.';
+  }
+  if (data.description && data.description.length > 5000) {
+    return 'Product description must be 5,000 characters or fewer.';
+  }
+  const values = [data.price, data.widthCm, data.heightCm, data.depthCm, data.weightGrams];
+  if (values.some((value) => value !== null && (value < 0 || value > 2_147_483_647))) {
+    return 'Price, dimensions, and weight must be non-negative whole numbers within the supported range.';
+  }
+  return null;
+}
+
+const MASTER_MAX_DIMENSION = 2560;
+const THUMBNAIL_MAX_DIMENSION = 480;
+
+async function createImageDerivatives(source: Buffer) {
+  const image = sharp(source, { limitInputPixels: 40_000_000, animated: false }).rotate();
+  const metadata = await image.metadata();
+  if (!metadata.width || !metadata.height) throw new Error('Invalid image data.');
+
+  const resize = { width: MASTER_MAX_DIMENSION, height: MASTER_MAX_DIMENSION, fit: 'inside' as const, withoutEnlargement: true };
+  const thumbnailResize = { width: THUMBNAIL_MAX_DIMENSION, height: THUMBNAIL_MAX_DIMENSION, fit: 'inside' as const, withoutEnlargement: true };
+  const [master, thumbnail] = await Promise.all([
+    image.clone().resize(resize).webp({ quality: 82, effort: 4 }).toBuffer(),
+    image.clone().resize(thumbnailResize).webp({ quality: 72, effort: 4 }).toBuffer(),
+  ]);
+  return { master, thumbnail };
+}
+
+async function ensureCategoryExists(categoryId: string | null) {
+  if (!categoryId) return true;
+  const [category] = await db.select({ id: categories.id }).from(categories).where(eq(categories.id, categoryId)).limit(1);
+  return Boolean(category);
+}
+
+export async function createProduct(formData: FormData) {
+  const currentUser = await requireAdmin();
+  const data = parseProductFormData(formData);
+
+  const validationError = validateProductData(data);
+  if (validationError) return { success: false, error: validationError };
+  if (!/^\d+$/.test(String(formData.get('price') ?? ''))) return { success: false, error: 'Price is required and must be in whole paise.' };
+  if (!await ensureCategoryExists(data.categoryId)) return { success: false, error: 'Selected category no longer exists.' };
+
+  const slug = toSlug(data.name);
+  if (!slug) return { success: false, error: 'Product name must include letters or numbers.' };
+  const id = randomBytes(8).toString('hex');
+
+  try {
+    await db.insert(products).values({ id, slug, ...data });
+    await writeAuditEvent({
+      action: 'product_created',
+      outcome: 'success',
+      actorUserId: currentUser.id,
+      targetType: 'product',
+      targetId: id,
+      metadata: { name: data.name },
+    });
+    revalidatePath('/admin/products');
+    return { success: true, id };
+  } catch (error: unknown) {
+    const msg = error instanceof Error ? error.message : String(error);
+    if (msg.includes('unique')) return { success: false, error: 'A product with that name/slug already exists.' };
+    console.error('createProduct error:', error);
+    return { success: false, error: 'Failed to create product.' };
+  }
+}
+
+export async function updateProduct(id: string, formData: FormData) {
+  const currentUser = await requireAdmin();
+  const data = parseProductFormData(formData);
+
+  const validationError = validateProductData(data);
+  if (validationError) return { success: false, error: validationError };
+  if (!/^\d+$/.test(String(formData.get('price') ?? ''))) return { success: false, error: 'Price is required and must be in whole paise.' };
+  if (!await ensureCategoryExists(data.categoryId)) return { success: false, error: 'Selected category no longer exists.' };
+
+  const slug = toSlug(data.name);
+  if (!slug) return { success: false, error: 'Product name must include letters or numbers.' };
+
+  try {
+    const [updated] = await db
+      .update(products)
+      .set({ slug, ...data, updatedAt: new Date() })
+      .where(eq(products.id, id))
+      .returning({ id: products.id });
+
+    if (!updated) return { success: false, error: 'Product not found.' };
+
+    await writeAuditEvent({
+      action: 'product_updated',
+      outcome: 'success',
+      actorUserId: currentUser.id,
+      targetType: 'product',
+      targetId: id,
+      metadata: { name: data.name },
+    });
+    revalidatePath('/admin/products');
+    revalidatePath(`/admin/products/${id}`);
+    return { success: true };
+  } catch (error: unknown) {
+    const msg = error instanceof Error ? error.message : String(error);
+    if (msg.includes('unique')) return { success: false, error: 'A product with that name/slug already exists.' };
+    console.error('updateProduct error:', error);
+    return { success: false, error: 'Failed to update product.' };
+  }
+}
+
+export async function deleteProduct(id: string) {
+  const currentUser = await requireAdmin();
+
+  // Delete all R2 images for this product before removing the DB row
+  const images = await db
+    .select({ r2Key: productImages.r2Key, thumbnailR2Key: productImages.thumbnailR2Key })
+    .from(productImages)
+    .where(eq(productImages.productId, id));
+
+  try {
+    await Promise.all(images.flatMap((image) => [image.r2Key, image.thumbnailR2Key].filter((key): key is string => Boolean(key))).map(deleteFromR2));
+
+    const [deleted] = await db
+      .delete(products)
+      .where(eq(products.id, id))
+      .returning({ id: products.id });
+
+    if (!deleted) return { success: false, error: 'Product not found.' };
+
+    await writeAuditEvent({
+      action: 'product_deleted',
+      outcome: 'success',
+      actorUserId: currentUser.id,
+      targetType: 'product',
+      targetId: id,
+    });
+    revalidatePath('/admin/products');
+    return { success: true };
+  } catch (error) {
+    console.error('deleteProduct error:', error);
+    return { success: false, error: 'Failed to delete product.' };
+  }
+}
+
+// ─── Ecommerce — Product Images ────────────────────────────────────────────────
+
+export async function uploadProductImage(formData: FormData) {
+  const currentUser = await requireAdmin();
+
+  const productId = formData.get('productId');
+  const file = formData.get('file');
+  const altText = formData.get('altText');
+
+  if (typeof productId !== 'string' || !productId) {
+    return { success: false, error: 'Missing productId.' };
+  }
+  if (!(file instanceof File)) {
+    return { success: false, error: 'No file provided.' };
+  }
+
+  const [product] = await db.select({ id: products.id }).from(products).where(eq(products.id, productId)).limit(1);
+  if (!product) return { success: false, error: 'Product not found.' };
+
+  const ALLOWED_TYPES = ['image/jpeg', 'image/png', 'image/webp', 'image/avif', 'image/gif'];
+  const MAX_SIZE = 10 * 1024 * 1024; // 10 MB
+
+  if (!ALLOWED_TYPES.includes(file.type)) {
+    return { success: false, error: 'Only JPEG, PNG, WebP, AVIF and GIF images are allowed.' };
+  }
+  if (file.size > MAX_SIZE) {
+    return { success: false, error: 'File exceeds 10 MB limit.' };
+  }
+
+  // Determine the next position index
+  const [{ maxPos }] = await db
+    .select({ maxPos: sql<number>`coalesce(max(position), -1)` })
+    .from(productImages)
+    .where(eq(productImages.productId, productId));
+
+  const position = Number(maxPos) + 1;
+  const imageId = randomBytes(8).toString('hex');
+  const r2Key = `products/${productId}/${imageId}.webp`;
+  const thumbnailR2Key = `products/${productId}/${imageId}-thumb.webp`;
+
+  try {
+    const buffer = Buffer.from(await file.arrayBuffer());
+    const { master, thumbnail } = await createImageDerivatives(buffer);
+    const [url, thumbnailUrl] = await Promise.all([
+      uploadToR2(r2Key, master, 'image/webp'),
+      uploadToR2(thumbnailR2Key, thumbnail, 'image/webp'),
+    ]);
+
+    await db.insert(productImages).values({
+      id: imageId,
+      productId,
+      r2Key,
+      url,
+      thumbnailR2Key,
+      thumbnailUrl,
+      altText: typeof altText === 'string' ? altText.trim() || null : null,
+      position,
+    });
+
+    await writeAuditEvent({
+      action: 'product_image_uploaded',
+      outcome: 'success',
+      actorUserId: currentUser.id,
+      targetType: 'product',
+      targetId: productId,
+    });
+    revalidatePath(`/admin/products/${productId}`);
+    return { success: true, image: { id: imageId, url, thumbnailUrl, position } };
+  } catch (error) {
+    // If inserting metadata fails after a successful upload, avoid leaving an orphaned object.
+    await Promise.all([deleteFromR2(r2Key), deleteFromR2(thumbnailR2Key)].map((operation) => operation.catch(() => undefined)));
+    console.error('uploadProductImage error:', error);
+    return { success: false, error: 'Failed to upload image.' };
+  }
+}
+
+export async function deleteProductImage(imageId: string) {
+  const currentUser = await requireAdmin();
+
+  const [image] = await db
+    .select({ r2Key: productImages.r2Key, thumbnailR2Key: productImages.thumbnailR2Key, productId: productImages.productId })
+    .from(productImages)
+    .where(eq(productImages.id, imageId))
+    .limit(1);
+
+  if (!image) return { success: false, error: 'Image not found.' };
+
+  try {
+    await Promise.all([image.r2Key, image.thumbnailR2Key].filter((key): key is string => Boolean(key)).map(deleteFromR2));
+    await db.delete(productImages).where(eq(productImages.id, imageId));
+    await writeAuditEvent({
+      action: 'product_image_deleted',
+      outcome: 'success',
+      actorUserId: currentUser.id,
+      targetType: 'product',
+      targetId: image.productId,
+    });
+    revalidatePath(`/admin/products/${image.productId}`);
+    return { success: true };
+  } catch (error) {
+    console.error('deleteProductImage error:', error);
+    return { success: false, error: 'Failed to delete image.' };
+  }
+}
+
+export async function reorderProductImages(productId: string, orderedIds: string[]) {
+  const currentUser = await requireAdmin();
+
+  if (new Set(orderedIds).size !== orderedIds.length) {
+    return { success: false, error: 'Image order contains duplicate images.' };
+  }
+
+  try {
+    const existing = await db.select({ id: productImages.id }).from(productImages).where(eq(productImages.productId, productId));
+    if (existing.length !== orderedIds.length || existing.some((image) => !orderedIds.includes(image.id))) {
+      return { success: false, error: 'Image list does not match this product.' };
+    }
+    await Promise.all(
+      orderedIds.map((id, position) =>
+        db
+          .update(productImages)
+          .set({ position })
+          .where(and(eq(productImages.id, id), eq(productImages.productId, productId)))
+      )
+    );
+    await writeAuditEvent({
+      action: 'product_images_reordered',
+      outcome: 'success',
+      actorUserId: currentUser.id,
+      targetType: 'product',
+      targetId: productId,
+    });
+    revalidatePath(`/admin/products/${productId}`);
+    return { success: true };
+  } catch (error) {
+    console.error('reorderProductImages error:', error);
+    return { success: false, error: 'Failed to reorder images.' };
+  }
+}
+
+/** Delete an object shown in the Media Library. Only application product media is in scope. */
+export async function deleteMediaObject(key: string) {
+  const currentUser = await requireAdmin();
+  if (!key.startsWith('products/') || key.includes('..') || key.length > 500) {
+    return { success: false, error: 'Invalid media object.' };
+  }
+
+  const [linkedImage] = await db
+    .select({ id: productImages.id, productId: productImages.productId, thumbnailR2Key: productImages.thumbnailR2Key })
+    .from(productImages)
+    .where(eq(productImages.r2Key, key))
+    .limit(1);
+
+  try {
+    await Promise.all([key, linkedImage?.thumbnailR2Key].filter((candidate): candidate is string => Boolean(candidate)).map(deleteFromR2));
+    if (linkedImage) await db.delete(productImages).where(eq(productImages.id, linkedImage.id));
+    await writeAuditEvent({
+      action: 'media_object_deleted',
+      outcome: 'success',
+      actorUserId: currentUser.id,
+      targetType: linkedImage ? 'product_image' : 'media_object',
+      targetId: linkedImage?.id,
+      metadata: { linked: Boolean(linkedImage) },
+    });
+    revalidatePath('/admin/media');
+    if (linkedImage) revalidatePath(`/admin/products/${linkedImage.productId}`);
+    return { success: true };
+  } catch (error) {
+    console.error('deleteMediaObject error:', error);
+    return { success: false, error: 'Failed to delete media object.' };
   }
 }

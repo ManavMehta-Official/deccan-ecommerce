@@ -3,9 +3,11 @@ import { hasSuperAdmin, getAllUsers } from '@/db/queries';
 import { AdminSidebar } from '@/components/admin/adminSidebar';
 import { GlobalSearch } from '@/components/admin/globalSearch';
 import { Breadcrumbs } from '@/components/admin/breadcrumbs';
-import { ThemeToggle } from '@/components/themeToggle';
 import { requireAdmin } from '@/lib/auth';
 import { MobileNav } from '@/components/admin/mobileNav';
+
+// This layout reads the session and the database, so it must always render per request.
+export const dynamic = 'force-dynamic';
 
 export default async function DashboardLayout({
   children,

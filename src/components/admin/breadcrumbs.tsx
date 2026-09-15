@@ -10,6 +10,9 @@ const routeLabels: Record<string, string> = {
   users: 'Users',
   settings: 'Settings',
   audit: 'Audit Log',
+  categories: 'Categories',
+  products: 'Products',
+  media: 'Media Library',
 };
 
 export function Breadcrumbs() {

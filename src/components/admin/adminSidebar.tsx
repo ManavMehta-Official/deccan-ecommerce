@@ -3,15 +3,18 @@
 
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
-import { ClipboardList, LayoutDashboard, Users, Settings } from 'lucide-react';
+import { ClipboardList, LayoutDashboard, Users, Settings, Tag, ShoppingBag, Images } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { AdminUserMenu } from '@/components/admin/adminUserMenu';
 import logo from "../../../public/logo.svg";
 import Image from 'next/image';
 
 const navItems = [
-  { href: '/admin', label: 'Dashboard', icon: LayoutDashboard },
+  { href: '/admin', label: 'Dashboard', icon: LayoutDashboard, exact: true },
   { href: '/admin/users', label: 'Users', icon: Users },
+  { href: '/admin/categories', label: 'Categories', icon: Tag },
+  { href: '/admin/products', label: 'Products', icon: ShoppingBag },
+  { href: '/admin/media', label: 'Media Library', icon: Images },
   { href: '/admin/audit', label: 'Audit Log', icon: ClipboardList },
   { href: '/admin/settings', label: 'Settings', icon: Settings },
 ];
@@ -33,7 +36,7 @@ export function AdminSidebar({ user }: React.ComponentProps<typeof AdminUserMenu
         <nav className="space-y-1">
           {navItems.map((item) => {
             const Icon = item.icon;
-            const isActive = pathname === item.href;
+            const isActive = item.exact ? pathname === item.href : pathname.startsWith(item.href);
             return (
               <Link
                 key={item.href}

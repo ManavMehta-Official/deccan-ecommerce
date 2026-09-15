@@ -1,6 +1,16 @@
 import { db } from '@/db';
-import { adminSessions, auditEvents, emailSettings, users } from '@/db/schema';
-import { and, asc, count, desc, eq, gte, ilike, isNotNull, isNull, lt, lte, or } from 'drizzle-orm';
+import { adminSessions, auditEvents, categories, emailSettings, productImages, products, users } from '@/db/schema';
+import { and, asc, count, desc, eq, gte, ilike, isNotNull, isNull, lt, lte, or, sql } from 'drizzle-orm';
+
+// ─── Slug utility ─────────────────────────────────────────────────────────────
+export function toSlug(str: string) {
+  return str
+    .toLowerCase()
+    .trim()
+    .replace(/[^\w\s-]/g, '')
+    .replace(/[\s_]+/g, '-')
+    .replace(/-+/g, '-');
+}
 
 export async function hasSuperAdmin(): Promise<boolean> {
   const [result] = await db
@@ -314,4 +324,132 @@ export async function deleteAuditEventsBefore(date: Date) {
   return db.delete(auditEvents)
     .where(lt(auditEvents.createdAt, date))
     .returning({ id: auditEvents.id });
+}
+
+// ─── Categories ────────────────────────────────────────────────────────────────
+
+export async function getCategories() {
+  return db
+    .select({
+      id: categories.id,
+      name: categories.name,
+      slug: categories.slug,
+      description: categories.description,
+      createdAt: categories.createdAt,
+      updatedAt: categories.updatedAt,
+      productCount: sql<number>`(select count(*) from products where products.category_id = categories.id)`,
+    })
+    .from(categories)
+    .orderBy(asc(categories.name));
+}
+
+export async function getCategoryById(id: string) {
+  const [category] = await db
+    .select()
+    .from(categories)
+    .where(eq(categories.id, id))
+    .limit(1);
+  return category ?? null;
+}
+
+// ─── Products ──────────────────────────────────────────────────────────────────
+
+export type ProductQueryOptions = {
+  query?: string;
+  categoryId?: string;
+  featured?: boolean;
+  newArrival?: boolean;
+  outOfStock?: boolean;
+  page?: number;
+  pageSize?: number;
+};
+
+const DEFAULT_PRODUCT_PAGE_SIZE = 20;
+
+function productConditions(options: ProductQueryOptions) {
+  const conditions = [];
+  if (options.categoryId) conditions.push(eq(products.categoryId, options.categoryId));
+  if (options.featured !== undefined) conditions.push(eq(products.featured, options.featured ? 1 : 0));
+  if (options.newArrival !== undefined) conditions.push(eq(products.newArrival, options.newArrival ? 1 : 0));
+  if (options.outOfStock !== undefined) conditions.push(eq(products.outOfStock, options.outOfStock ? 1 : 0));
+  if (options.query) {
+    const q = `%${options.query.trim().slice(0, 100)}%`;
+    conditions.push(or(ilike(products.name, q), ilike(products.slug, q)));
+  }
+  return conditions.length > 0 ? and(...conditions) : undefined;
+}
+
+export async function getPaginatedProducts(options: ProductQueryOptions = {}) {
+  const page = Math.max(1, Math.floor(options.page ?? 1));
+  const pageSize = Math.max(1, Math.min(100, Math.floor(options.pageSize ?? DEFAULT_PRODUCT_PAGE_SIZE)));
+  const where = productConditions(options);
+
+  const [productList, [{ total }]] = await Promise.all([
+    db
+      .select({
+        id: products.id,
+        name: products.name,
+        slug: products.slug,
+        price: products.price,
+        outOfStock: products.outOfStock,
+        newArrival: products.newArrival,
+        featured: products.featured,
+        categoryId: products.categoryId,
+        categoryName: categories.name,
+        createdAt: products.createdAt,
+        updatedAt: products.updatedAt,
+      })
+      .from(products)
+      .leftJoin(categories, eq(products.categoryId, categories.id))
+      .where(where)
+      .orderBy(desc(products.createdAt))
+      .limit(pageSize)
+      .offset((page - 1) * pageSize),
+    db.select({ total: count() }).from(products).where(where),
+  ]);
+
+  const totalCount = Number(total);
+  return {
+    products: productList,
+    page,
+    pageSize,
+    total: totalCount,
+    totalPages: Math.max(1, Math.ceil(totalCount / pageSize)),
+  };
+}
+
+export async function getProductById(id: string) {
+  const [product] = await db
+    .select({
+      id: products.id,
+      name: products.name,
+      slug: products.slug,
+      description: products.description,
+      price: products.price,
+      outOfStock: products.outOfStock,
+      newArrival: products.newArrival,
+      featured: products.featured,
+      widthCm: products.widthCm,
+      heightCm: products.heightCm,
+      depthCm: products.depthCm,
+      weightGrams: products.weightGrams,
+      categoryId: products.categoryId,
+      categoryName: categories.name,
+      createdAt: products.createdAt,
+      updatedAt: products.updatedAt,
+    })
+    .from(products)
+    .leftJoin(categories, eq(products.categoryId, categories.id))
+    .where(eq(products.id, id))
+    .limit(1);
+
+  if (!product) return null;
+
+  const images = await db
+    .select()
+    .from(productImages)
+    .where(eq(productImages.productId, id))
+    .orderBy(asc(productImages.position));
+
+  return { ...product, images };
 }
